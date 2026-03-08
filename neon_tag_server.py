@@ -33,7 +33,6 @@ import os
 import random
 import sys
 import time
-from http import HTTPStatus
 
 try:
     import websockets
@@ -89,27 +88,6 @@ async def cleanup_stale_rooms() -> None:
                             pass
                 print(f"[~] Room '{code}' cleaned up (stale)")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  HEALTH CHECK — HTTP handler for cloud platforms
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def health_check(path, request_headers):
-    """Respond to plain HTTP requests with 200 OK (health check for Render/Railway).
-    Return None to proceed with normal WebSocket upgrade."""
-    # Check if this looks like a normal HTTP request (not a WebSocket upgrade)
-    if "Upgrade" not in request_headers:
-        body = json.dumps({
-            "status": "ok",
-            "service": "neon-tag-relay",
-            "rooms": len(rooms),
-            "players": sum(
-                (1 if r.get("host") else 0) + (1 if r.get("guest") else 0)
-                for r in rooms.values()
-            ),
-        }).encode()
-        return HTTPStatus.OK, [("Content-Type", "application/json")], body
-    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -206,7 +184,6 @@ async def main() -> None:
     print(f"╔══════════════════════════════════════════════╗")
     print(f"║   Neon Tag Relay Server                      ║")
     print(f"║   Listening on  ws://{host}:{port:<5}             ║")
-    print(f"║   Health check: http://{host}:{port:<5}/           ║")
     print(f"╚══════════════════════════════════════════════╝")
     print()
     print("Players connect from ANY network using room codes.")
@@ -217,7 +194,6 @@ async def main() -> None:
 
     async with serve(
         handler, host, port,
-        process_request=health_check,
         ping_interval=20,
         ping_timeout=20,
         close_timeout=10,
