@@ -705,55 +705,293 @@ class NetworkManager:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  TEXT INPUT WIDGET
+#  CLIPBOARD HELPERS  (Windows – subprocess fallback)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _clipboard_get() -> str:
+    """Read text from the system clipboard."""
+    try:
+        import subprocess
+        r = subprocess.run(
+            ['powershell', '-NoProfile', '-Command', 'Get-Clipboard'],
+            capture_output=True, text=True, timeout=2,
+            creationflags=0x08000000)
+        return r.stdout.strip().replace('\r\n', '').replace('\n', '')
+    except Exception:
+        return ""
+
+def _clipboard_set(text: str) -> None:
+    """Write text to the system clipboard."""
+    try:
+        import subprocess
+        subprocess.Popen(
+            ['clip'], stdin=subprocess.PIPE,
+            creationflags=0x08000000
+        ).communicate(text.encode())
+    except Exception:
+        pass
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  TEXT INPUT WIDGET  (cursor · selection · clipboard · uppercase)
 # ═════════════════════════════════════════════════════════════════════════════
 
 class TextInput:
-    def __init__(self, placeholder:str="", max_len:int=40,
-                 allowed:Optional[set]=None, font=None):
-        self.text        = ""
-        self.placeholder = placeholder
-        self.max_len     = max_len
-        self.allowed     = allowed
-        self.font        = font or F_MD
-        self.active      = False
-        self._cursor_t   = 0.0
+    """Full-featured single-line text input for pygame.
 
-    def handle_key(self, ev:pygame.event.Event)->None:
-        if not self.active: return
-        if ev.key==pygame.K_BACKSPACE:
-            self.text=self.text[:-1]
-        elif ev.key not in (pygame.K_RETURN,pygame.K_ESCAPE,pygame.K_TAB):
-            ch=ev.unicode.lower()
-            if ch and ch.isprintable() and not ch.isspace():
-                if len(self.text)<self.max_len:
-                    if self.allowed is None or ch in self.allowed:
-                        self.text+=ch
+    Features
+    --------
+    - Cursor: ← → Home End  (Ctrl+← / Ctrl+→ word-jump)
+    - Selection: Shift+arrows, Ctrl+A, click to position cursor
+    - Clipboard: Ctrl+C copy, Ctrl+V paste, Ctrl+X cut
+    - Delete / Backspace (respects selection)
+    - force_lower: when True all input is lowered (room codes)
+    """
 
-    def update(self, dt:float)->None:
-        self._cursor_t=(self._cursor_t+dt)%1.0
+    def __init__(self, placeholder: str = "", max_len: int = 40,
+                 allowed: Optional[set] = None, font=None,
+                 force_lower: bool = False):
+        self.text         = ""
+        self.placeholder  = placeholder
+        self.max_len      = max_len
+        self.allowed      = allowed
+        self.font         = font or F_MD
+        self.active       = False
+        self.force_lower  = force_lower
+        self._cursor_t    = 0.0
+        # cursor & selection (-1 = no selection)
+        self.cur           = 0
+        self.sel_start     = -1
+        self.sel_end       = -1
 
-    def draw(self, surf:pygame.Surface, rect:pygame.Rect,
-             label:str="", error:str="")->None:
-        # background
-        pygame.draw.rect(surf,(18,14,36),rect,border_radius=5)
-        bc=TXT_P1 if self.active else (TXT_ERR if error else HUD_LINE)
-        pygame.draw.rect(surf,bc,rect,2,border_radius=5)
-        # text / placeholder
-        show=self.text or self.placeholder
-        col =TXT_HI if self.text else TXT_DIM
-        txt =show
-        if self.active and self._cursor_t<0.5: txt+="█"
-        s=self.font.render(txt,True,col)
-        surf.blit(s,(rect.x+9,rect.centery-s.get_height()//2))
-        # label above
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    @property
+    def has_sel(self) -> bool:
+        return (self.sel_start >= 0 and self.sel_end >= 0
+                and self.sel_start != self.sel_end)
+
+    def _sel_range(self):
+        if not self.has_sel:
+            return None
+        return min(self.sel_start, self.sel_end), max(self.sel_start, self.sel_end)
+
+    def _del_sel(self) -> bool:
+        r = self._sel_range()
+        if r:
+            lo, hi = r
+            self.text = self.text[:lo] + self.text[hi:]
+            self.cur = lo
+            self.sel_start = self.sel_end = -1
+            return True
+        return False
+
+    def _clear_sel(self):
+        self.sel_start = self.sel_end = -1
+
+    def _begin_sel(self):
+        if self.sel_start < 0:
+            self.sel_start = self.cur
+        self.sel_end = self.cur
+
+    def select_all(self):
+        self.sel_start = 0
+        self.sel_end = len(self.text)
+        self.cur = len(self.text)
+
+    def _insert(self, s: str):
+        self._del_sel()
+        for ch in s:
+            if len(self.text) >= self.max_len:
+                break
+            if self.force_lower:
+                ch = ch.lower()
+            if ch.isprintable() and not ch.isspace():
+                if self.allowed is None or ch.lower() in self.allowed:
+                    self.text = self.text[:self.cur] + ch + self.text[self.cur:]
+                    self.cur += 1
+
+    def _word_left(self) -> int:
+        i = self.cur - 1
+        while i > 0 and not self.text[i-1].isalnum():
+            i -= 1
+        while i > 0 and self.text[i-1].isalnum():
+            i -= 1
+        return max(0, i)
+
+    def _word_right(self) -> int:
+        n = len(self.text)
+        i = self.cur
+        while i < n and not self.text[i].isalnum():
+            i += 1
+        while i < n and self.text[i].isalnum():
+            i += 1
+        return i
+
+    # ── event handling ────────────────────────────────────────────────────────
+
+    def handle_key(self, ev: pygame.event.Event) -> None:
+        if not self.active:
+            return
+
+        mods = pygame.key.get_mods()
+        ctrl  = bool(mods & pygame.KMOD_CTRL)
+        shift = bool(mods & pygame.KMOD_SHIFT)
+        k = ev.key
+
+        # ── CTRL combos ──────────────────────────────────────────────────────
+        if ctrl:
+            if k == pygame.K_a:
+                self.select_all(); return
+            if k == pygame.K_c:
+                r = self._sel_range()
+                _clipboard_set(self.text[r[0]:r[1]] if r else self.text)
+                return
+            if k == pygame.K_x:
+                r = self._sel_range()
+                if r:
+                    _clipboard_set(self.text[r[0]:r[1]])
+                    self._del_sel()
+                return
+            if k == pygame.K_v:
+                clip = _clipboard_get()
+                if clip:
+                    self._insert(clip)
+                return
+            if k == pygame.K_LEFT:
+                npos = self._word_left()
+                if shift:
+                    self._begin_sel(); self.cur = npos; self.sel_end = npos
+                else:
+                    self._clear_sel(); self.cur = npos
+                return
+            if k == pygame.K_RIGHT:
+                npos = self._word_right()
+                if shift:
+                    self._begin_sel(); self.cur = npos; self.sel_end = npos
+                else:
+                    self._clear_sel(); self.cur = npos
+                return
+
+        # ── BACKSPACE ─────────────────────────────────────────────────────────
+        if k == pygame.K_BACKSPACE:
+            if not self._del_sel():
+                if self.cur > 0:
+                    self.text = self.text[:self.cur-1] + self.text[self.cur:]
+                    self.cur -= 1
+            return
+
+        # ── DELETE ────────────────────────────────────────────────────────────
+        if k == pygame.K_DELETE:
+            if not self._del_sel():
+                if self.cur < len(self.text):
+                    self.text = self.text[:self.cur] + self.text[self.cur+1:]
+            return
+
+        # ── LEFT ──────────────────────────────────────────────────────────────
+        if k == pygame.K_LEFT:
+            if shift:
+                if self.sel_start < 0: self.sel_start = self.cur
+                self.cur = max(0, self.cur - 1); self.sel_end = self.cur
+            else:
+                self._clear_sel(); self.cur = max(0, self.cur - 1)
+            return
+
+        # ── RIGHT ─────────────────────────────────────────────────────────────
+        if k == pygame.K_RIGHT:
+            if shift:
+                if self.sel_start < 0: self.sel_start = self.cur
+                self.cur = min(len(self.text), self.cur + 1); self.sel_end = self.cur
+            else:
+                self._clear_sel(); self.cur = min(len(self.text), self.cur + 1)
+            return
+
+        # ── HOME ──────────────────────────────────────────────────────────────
+        if k == pygame.K_HOME:
+            if shift:
+                self._begin_sel(); self.cur = 0; self.sel_end = 0
+            else:
+                self._clear_sel(); self.cur = 0
+            return
+
+        # ── END ───────────────────────────────────────────────────────────────
+        if k == pygame.K_END:
+            if shift:
+                self._begin_sel(); self.cur = len(self.text); self.sel_end = self.cur
+            else:
+                self._clear_sel(); self.cur = len(self.text)
+            return
+
+        # ── REGULAR CHARACTER ─────────────────────────────────────────────────
+        if k not in (pygame.K_RETURN, pygame.K_ESCAPE, pygame.K_TAB,
+                      pygame.K_LSHIFT, pygame.K_RSHIFT,
+                      pygame.K_LCTRL, pygame.K_RCTRL,
+                      pygame.K_LALT, pygame.K_RALT,
+                      pygame.K_CAPSLOCK):
+            ch = ev.unicode
+            if ch and ch.isprintable():
+                self._insert(ch)
+
+    def handle_click(self, mx: int, rect: pygame.Rect) -> None:
+        """Position cursor at the clicked character."""
+        if not self.text:
+            self.cur = 0; self._clear_sel(); return
+        rel_x = mx - (rect.x + 9)
+        best, best_d = 0, abs(rel_x)
+        for i in range(1, len(self.text) + 1):
+            w = self.font.size(self.text[:i])[0]
+            d = abs(rel_x - w)
+            if d < best_d:
+                best, best_d = i, d
+        self.cur = best
+        self._clear_sel()
+
+    # ── update & draw ─────────────────────────────────────────────────────────
+
+    def update(self, dt: float) -> None:
+        self._cursor_t = (self._cursor_t + dt) % 1.0
+
+    def draw(self, surf: pygame.Surface, rect: pygame.Rect,
+             label: str = "", error: str = "") -> None:
+        pygame.draw.rect(surf, (18, 14, 36), rect, border_radius=5)
+        bc = TXT_P1 if self.active else (TXT_ERR if error else HUD_LINE)
+        pygame.draw.rect(surf, bc, rect, 2, border_radius=5)
+
+        ty = rect.centery
+        tx = rect.x + 9
+
+        if self.text:
+            col = TXT_HI
+            full = self.font.render(self.text, True, col)
+            fh = full.get_height()
+
+            # selection highlight
+            if self.active and self.has_sel:
+                lo, hi = self._sel_range()
+                x0 = self.font.size(self.text[:lo])[0]
+                x1 = self.font.size(self.text[:hi])[0]
+                sr = pygame.Rect(tx + x0, ty - fh // 2, x1 - x0, fh)
+                pygame.draw.rect(surf, (50, 80, 160), sr)
+
+            surf.blit(full, (tx, ty - fh // 2))
+
+            # blinking cursor
+            if self.active and self._cursor_t < 0.55:
+                cx = tx + self.font.size(self.text[:self.cur])[0]
+                pygame.draw.line(surf, TXT_HI,
+                                 (cx, ty - fh // 2), (cx, ty + fh // 2), 2)
+        else:
+            ph = self.font.render(self.placeholder, True, TXT_DIM)
+            surf.blit(ph, (tx, ty - ph.get_height() // 2))
+            if self.active and self._cursor_t < 0.55:
+                pygame.draw.line(surf, TXT_HI, (tx, ty - 10), (tx, ty + 10), 2)
+
         if label:
-            ls=F_SM.render(label,True,TXT_DIM)
-            surf.blit(ls,(rect.x,rect.y-ls.get_height()-3))
-        # error below
+            ls = F_SM.render(label, True, TXT_DIM)
+            surf.blit(ls, (rect.x, rect.y - ls.get_height() - 3))
         if error:
-            es=F_SM.render(error,True,TXT_ERR)
-            surf.blit(es,(rect.x,rect.bottom+4))
+            es = F_SM.render(error, True, TXT_ERR)
+            surf.blit(es, (rect.x, rect.bottom + 4))
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  DRAWING HELPERS
@@ -1120,8 +1358,10 @@ class Game:
         self._connecting  = False
         self.url_input    = TextInput("wss://your-app.onrender.com", 80)
         self.url_input.text = "ws://localhost:8765"
+        self.url_input.cur  = len(self.url_input.text)
         self.code_input   = TextInput("abcd", 4,
-                                       allowed=set("abcdefghijklmnopqrstuvwxyz"))
+                                       allowed=set("abcdefghijklmnopqrstuvwxyz"),
+                                       force_lower=True)
         # guest buffered remote input from prev net message
         self._guest_input: Dict = {'u':0,'d':0,'l':0,'r':0}
         self._load_map(1)
@@ -1532,11 +1772,23 @@ class Game:
                     SFX.play("click")
                     self.online_sub="joining"
                     self.code_input.text=""; self.code_input.active=True
-            # activate text inputs
+                    self.code_input.cur=0
+            # activate / click-position text inputs
             if self.state==self.ONLINE_MENU:
-                self.url_input.active=self.url_input.handle_key if False else \
-                    pygame.Rect(WIN_W//2-240,102,480,36).collidepoint(ev.pos)
-                self.url_input.active=pygame.Rect(WIN_W//2-240,102,480,36).collidepoint(ev.pos)
+                url_rect=pygame.Rect(WIN_W//2-240,102,480,36)
+                if url_rect.collidepoint(ev.pos):
+                    self.url_input.active=True
+                    self.url_input.handle_click(ev.pos[0],url_rect)
+                else:
+                    self.url_input.active=False
+                # code input (only when joining)
+                if self.online_sub=="joining":
+                    code_rect=pygame.Rect(WIN_W//2-100,190,200,44)
+                    if code_rect.collidepoint(ev.pos):
+                        self.code_input.active=True
+                        self.code_input.handle_click(ev.pos[0],code_rect)
+                    else:
+                        self.code_input.active=False
 
         return True
 
@@ -1563,13 +1815,7 @@ class Game:
                     self.online_sub="waiting"
                     self.net_status=""; self.net_status_c=TXT_DIM
                     # Copy code to clipboard
-                    try:
-                        import subprocess
-                        subprocess.Popen(['clip'],stdin=subprocess.PIPE,
-                                         creationflags=0x08000000
-                                         ).communicate(msg['code'].upper().encode())
-                    except Exception:
-                        pass  # clipboard not available — no big deal
+                    _clipboard_set(msg['code'].upper())
                     break
                 else:
                     self.net_status="Unexpected server response"; self.net_status_c=TXT_ERR
