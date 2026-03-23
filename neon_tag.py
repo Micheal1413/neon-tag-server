@@ -1,7 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
 ║                       N E O N   T A G  v2                            ║
-║         Two-Playd§er Top-Down Tag  ·  pygame-ce  ·  Online Play        ║
+║         Two-Player Top-Down Tag  ·  pygame-ce  ·  Online Play          ║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║  LOCAL PLAY                                                          ║
 ║    P1 (Cyan)   :  W / A / S / D                                      ║
@@ -225,34 +225,48 @@ class SoundManager:
         except Exception:
             self.enabled = False
 
-    def play(self, name: str, delay_ms: int = 0) -> None:
+    def play(self, name: str) -> None:
         if not self.enabled:
             return
         s = self._sounds.get(name)
         if s:
-            if delay_ms:
-                pygame.time.set_timer(pygame.USEREVENT + hash(name) % 16, delay_ms, loops=1)
-            else:
-                s.play()
+            s.play()
+
+    # Pending delayed sounds: list of (play_at_time, sound_name)
+    _pending: List = []
 
     def play_round_win(self) -> None:
         """Staggered 3-note fanfare."""
         if not self.enabled:
             return
-        for name, delay in [("round_win", 0), ("round_win2", 185), ("round_win3", 370)]:
-            s = self._sounds.get(name)
-            if s:
-                pygame.time.set_timer(pygame.USEREVENT, 0)
-                asyncio.get_event_loop().call_later(delay / 1000, s.play)
+        now = _time.time()
+        for name, delay in [("round_win", 0), ("round_win2", 0.185), ("round_win3", 0.370)]:
+            if self._sounds.get(name):
+                self._pending.append((now + delay, name))
 
     def play_match_win(self) -> None:
         if not self.enabled:
             return
-        for name, delay in [("match_win",0),("match_win2",130),
-                             ("match_win3",260),("match_win4",390)]:
-            s = self._sounds.get(name)
-            if s:
-                asyncio.get_event_loop().call_later(delay / 1000, s.play)
+        now = _time.time()
+        for name, delay in [("match_win", 0), ("match_win2", 0.130),
+                             ("match_win3", 0.260), ("match_win4", 0.390)]:
+            if self._sounds.get(name):
+                self._pending.append((now + delay, name))
+
+    def update_pending(self) -> None:
+        """Call each frame to play delayed sounds when their time arrives."""
+        if not self._pending:
+            return
+        now = _time.time()
+        still_pending = []
+        for play_at, name in self._pending:
+            if now >= play_at:
+                s = self._sounds.get(name)
+                if s:
+                    s.play()
+            else:
+                still_pending.append((play_at, name))
+        self._pending = still_pending
 
 
 SFX = SoundManager()
@@ -1291,7 +1305,6 @@ def draw_online_menu(surf:pygame.Surface,
     elif sub_state=="joining":
         # enter code
         cr=pygame.Rect(WIN_W//2-100,190,200,44)
-        err="" if len(code_input.text)==0 else ""
         code_input.draw(surf,cr,label="Enter 4-letter room code:")
         j_lbl=F_MD.render("Press ENTER to connect",True,TXT_DIM)
         surf.blit(j_lbl,j_lbl.get_rect(center=(WIN_W//2,256)))
@@ -1364,6 +1377,12 @@ class Game:
                                        force_lower=True)
         # guest buffered remote input from prev net message
         self._guest_input: Dict = {'u':0,'d':0,'l':0,'r':0}
+        # network throttle: only send input when changed, throttle host state
+        self._last_sent_input: Dict = {'u':0,'d':0,'l':0,'r':0}
+        self._host_send_acc: float = 0.0       # accumulator for host send rate
+        self._host_send_interval: float = 1.0/20.0  # 20 Hz state updates
+        # tag event flag for syncing effects to guest
+        self._tag_happened: bool = False
         self._load_map(1)
 
     # ── map loading ───────────────────────────────────────────────────────────
@@ -1417,14 +1436,19 @@ class Game:
         if prey.grace>0: return
         if it.rect.colliderect(prey.rect):
             # TAG!
-            SFX.play("tag")
-            emit_burst(self.ps,prey.pos.x,prey.pos.y,FLASH_C,n=30,spd=200)
-            self.floats.append(FloatingText(prey.pos.x,prey.pos.y-20,"TAG!",TAG_C,30,1.0))
-            self.shake.hit(0.9)
-            self.flash=0.28
+            self._trigger_tag_effects(prey.pos.x, prey.pos.y)
             it.is_it=False; it.grace=GRACE
             prey.is_it=True; prey.grace=0.0
             prey._it_time=0.0
+            self._tag_happened = True   # signal to send to guest
+
+    def _trigger_tag_effects(self, x: float, y: float) -> None:
+        """Play tag sound + visual effects. Used by both host and guest."""
+        SFX.play("tag")
+        emit_burst(self.ps, x, y, FLASH_C, n=30, spd=200)
+        self.floats.append(FloatingText(x, y - 20, "TAG!", TAG_C, 30, 1.0))
+        self.shake.hit(0.9)
+        self.flash = 0.28
 
     # ── round end ─────────────────────────────────────────────────────────────
 
@@ -1478,6 +1502,11 @@ class Game:
             self.p1_wins  =int(msg.get("w1",0))
             self.p2_wins  =int(msg.get("w2",0))
             self.round_num=int(msg.get("rn",1))
+            # Tag effects sync: host signals when a tag happened
+            if msg.get("tag") and self.p2:
+                tx = float(msg["tag"].get("x", self.p2.pos.x))
+                ty = float(msg["tag"].get("y", self.p2.pos.y))
+                self._trigger_tag_effects(tx, ty)
             ph=msg.get("ph","playing")
             if ph=="countdown":
                 if self.state not in (self.COUNTDOWN,):
@@ -1511,6 +1540,7 @@ class Game:
 
     def update(self, dt:float)->None:
         self.pulse+=dt
+        SFX.update_pending()  # play delayed fanfare notes
 
         # process network messages every frame
         if self.net:
@@ -1600,15 +1630,21 @@ class Game:
             if self.net:
                 kb=pygame.key.get_pressed()
                 # Guest can use WASD *or* Arrow keys (whichever is pressed)
-                self.net.send({"t":"input",
-                               "u":int(kb[pygame.K_UP]   or kb[pygame.K_w]),
-                               "d":int(kb[pygame.K_DOWN] or kb[pygame.K_s]),
-                               "l":int(kb[pygame.K_LEFT] or kb[pygame.K_a]),
-                               "r":int(kb[pygame.K_RIGHT]or kb[pygame.K_d])})
+                cur_input={'u':int(kb[pygame.K_UP]   or kb[pygame.K_w]),
+                           'd':int(kb[pygame.K_DOWN] or kb[pygame.K_s]),
+                           'l':int(kb[pygame.K_LEFT] or kb[pygame.K_a]),
+                           'r':int(kb[pygame.K_RIGHT]or kb[pygame.K_d])}
+                # Only send when input actually changes
+                if cur_input != self._last_sent_input:
+                    self._last_sent_input = cur_input.copy()
+                    self.net.send({"t":"input", **cur_input})
 
-        # online host: send authoritative state every frame
+        # online host: send authoritative state at throttled rate (20 Hz)
         if self.online_role=="host" and self.net:
-            self._send_host_state(phase="playing")
+            self._host_send_acc += dt
+            if self._host_send_acc >= self._host_send_interval:
+                self._host_send_acc = 0.0
+                self._send_host_state(phase="playing")
 
     def _send_host_state(self, phase:str)->None:
         """Build & queue state message to guest."""
@@ -1619,6 +1655,11 @@ class Game:
         elif phase=="round_end":
             rw=self.round_winner.pid if self.round_winner else 0
             extra={"rw":rw,"ret":round(self.re_timer,2)}
+        # Include tag event info so guest can play effects locally
+        if self._tag_happened:
+            prey = self.p2 if self.p1.is_it else self.p1
+            extra["tag"] = {"x": round(prey.pos.x, 1), "y": round(prey.pos.y, 1)}
+            self._tag_happened = False
         self.net.send({"t":"state","ph":phase,
                        "tl":round(self.time_left,2),
                        "w1":self.p1_wins,"w2":self.p2_wins,
@@ -1658,9 +1699,7 @@ class Game:
 
         # ── ping badge (online only) ─────────────────────────────────────────
         if self.net and self.online_role:
-            draw_ping_badge(surf,
-                            self.net.ping_ms if self.net else -1,
-                            self.net.reconnecting if self.net else False)
+            draw_ping_badge(surf, self.net.ping_ms, self.net.reconnecting)
 
         draw_hud(surf,self.p1,self.p2,self.time_left,
                  self.p1_wins,self.p2_wins,
@@ -1797,59 +1836,63 @@ class Game:
     async def _online_host(self)->None:
         if self._connecting: return
         self._connecting=True
-        self.net_status="Connecting…"; self.net_status_c=TXT_DIM
-        nm=NetworkManager()
-        ok=await nm.connect(self.url_input.text)
-        if not ok:
-            self.net_status=f"Error: {nm.error}"; self.net_status_c=TXT_ERR
-            self._connecting=False; return
-        nm.send({"t":"create"})
-        # wait for response
-        for _ in range(100):
-            await asyncio.sleep(0.05)
-            msg=nm.recv()
-            if msg:
-                if msg.get("t")=="ok" and msg.get("role")=="host":
-                    self.net=nm; self.online_role="host"
-                    self.online_code=msg["code"]
-                    self.online_sub="waiting"
-                    self.net_status=""; self.net_status_c=TXT_DIM
-                    # Copy code to clipboard
-                    _clipboard_set(msg['code'].upper())
-                    break
-                else:
-                    self.net_status="Unexpected server response"; self.net_status_c=TXT_ERR
-                    break
-        else:
-            self.net_status="Server timeout"; self.net_status_c=TXT_ERR
-        self._connecting=False
+        try:
+            self.net_status="Connecting…"; self.net_status_c=TXT_DIM
+            nm=NetworkManager()
+            ok=await nm.connect(self.url_input.text)
+            if not ok:
+                self.net_status=f"Error: {nm.error}"; self.net_status_c=TXT_ERR
+                return
+            nm.send({"t":"create"})
+            # wait for response
+            for _ in range(100):
+                await asyncio.sleep(0.05)
+                msg=nm.recv()
+                if msg:
+                    if msg.get("t")=="ok" and msg.get("role")=="host":
+                        self.net=nm; self.online_role="host"
+                        self.online_code=msg["code"]
+                        self.online_sub="waiting"
+                        self.net_status=""; self.net_status_c=TXT_DIM
+                        # Copy code to clipboard
+                        _clipboard_set(msg['code'].upper())
+                        break
+                    else:
+                        self.net_status="Unexpected server response"; self.net_status_c=TXT_ERR
+                        break
+            else:
+                self.net_status="Server timeout"; self.net_status_c=TXT_ERR
+        finally:
+            self._connecting=False
 
     async def _online_join(self, code:str)->None:
         if self._connecting: return
         self._connecting=True
-        self.net_status=f"Connecting to '{code}'…"; self.net_status_c=TXT_DIM
-        nm=NetworkManager()
-        ok=await nm.connect(self.url_input.text)
-        if not ok:
-            self.net_status=f"Error: {nm.error}"; self.net_status_c=TXT_ERR
-            self._connecting=False; return
-        nm.send({"t":"join","code":code})
-        for _ in range(100):
-            await asyncio.sleep(0.05)
-            msg=nm.recv()
-            if msg:
-                if msg.get("t")=="ok" and msg.get("role")=="guest":
-                    self.net=nm; self.online_role="guest"
-                    self.online_code=code; self.online_sub="joining"
-                    self.net_status="Connected! Waiting for host to start…"
-                    self.net_status_c=TXT_OK
-                    break
-                elif msg.get("t")=="err":
-                    self.net_status=f"Error: {msg.get('msg','?')}"; self.net_status_c=TXT_ERR
-                    break
-        else:
-            self.net_status="Server timeout"; self.net_status_c=TXT_ERR
-        self._connecting=False
+        try:
+            self.net_status=f"Connecting to '{code}'…"; self.net_status_c=TXT_DIM
+            nm=NetworkManager()
+            ok=await nm.connect(self.url_input.text)
+            if not ok:
+                self.net_status=f"Error: {nm.error}"; self.net_status_c=TXT_ERR
+                return
+            nm.send({"t":"join","code":code})
+            for _ in range(100):
+                await asyncio.sleep(0.05)
+                msg=nm.recv()
+                if msg:
+                    if msg.get("t")=="ok" and msg.get("role")=="guest":
+                        self.net=nm; self.online_role="guest"
+                        self.online_code=code; self.online_sub="joining"
+                        self.net_status="Connected! Waiting for host to start…"
+                        self.net_status_c=TXT_OK
+                        break
+                    elif msg.get("t")=="err":
+                        self.net_status=f"Error: {msg.get('msg','?')}"; self.net_status_c=TXT_ERR
+                        break
+            else:
+                self.net_status="Server timeout"; self.net_status_c=TXT_ERR
+        finally:
+            self._connecting=False
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1879,3 +1922,4 @@ async def main()->None:
 
 if __name__=="__main__":
     asyncio.run(main())
+
