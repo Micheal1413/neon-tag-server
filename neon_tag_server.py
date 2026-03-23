@@ -52,6 +52,9 @@ except ImportError:
 # rooms[code] = {"host": ws, "guest": ws|None, "last_active": timestamp}
 rooms: dict = {}
 
+# Track which room each websocket belongs to (for cleanup on duplicate create)
+ws_rooms: dict = {}   # ws -> (code, role)
+
 LETTERS = "abcdefghijklmnopqrstuvwxyz"
 ROOM_TIMEOUT = 600  # 10 minutes — auto-delete stale rooms
 
@@ -63,6 +66,22 @@ def gen_code() -> str:
         if code not in rooms:
             return code
     raise RuntimeError("No codes available – server full?")
+
+
+def _cleanup_ws_from_old_room(ws) -> None:
+    """If ws is already in a room, remove it from that room (handles duplicate create)."""
+    old = ws_rooms.pop(ws, None)
+    if old:
+        old_code, old_role = old
+        if old_code in rooms:
+            room = rooms[old_code]
+            # Clear our slot
+            if room.get(old_role) is ws:
+                room[old_role] = None
+            # If both slots empty, delete the room
+            if room["host"] is None and room["guest"] is None:
+                del rooms[old_code]
+                print(f"[~] Room '{old_code}' auto-cleaned (old room from same ws)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -82,6 +101,7 @@ async def cleanup_stale_rooms() -> None:
                 for role in ("host", "guest"):
                     ws = room.get(role)
                     if ws:
+                        ws_rooms.pop(ws, None)
                         try:
                             await ws.close(1000, "Room timed out")
                         except Exception:
@@ -109,8 +129,11 @@ async def handler(ws) -> None:
 
             # ── CREATE ROOM ───────────────────────────────────────────────────
             if t == "create":
+                # Clean up any old room this ws was in (prevents leaking rooms)
+                _cleanup_ws_from_old_room(ws)
                 code = gen_code()
                 rooms[code] = {"host": ws, "guest": None, "last_active": time.time()}
+                ws_rooms[ws] = (code, "host")
                 role = "host"
                 await ws.send(json.dumps({"t": "ok", "code": code, "role": "host"}))
                 print(f"[+] Room '{code}' created  (active rooms: {len(rooms)})")
@@ -123,17 +146,20 @@ async def handler(ws) -> None:
                 elif rooms[requested]["guest"] is not None:
                     await ws.send(json.dumps({"t": "err", "msg": "Room is full"}))
                 else:
+                    _cleanup_ws_from_old_room(ws)
                     code = requested
                     rooms[code]["guest"] = ws
                     rooms[code]["last_active"] = time.time()
+                    ws_rooms[ws] = (code, "guest")
                     role = "guest"
                     await ws.send(json.dumps({"t": "ok", "role": "guest"}))
                     # Notify host that their partner joined
                     host_ws = rooms[code]["host"]
-                    try:
-                        await host_ws.send(json.dumps({"t": "partner_joined"}))
-                    except Exception:
-                        pass
+                    if host_ws:
+                        try:
+                            await host_ws.send(json.dumps({"t": "partner_joined"}))
+                        except Exception:
+                            pass
                     print(f"[+] Guest joined room '{code}'  (active rooms: {len(rooms)})")
 
             # ── PING (latency measurement) ────────────────────────────────────
@@ -161,16 +187,27 @@ async def handler(ws) -> None:
 
     finally:
         # ── CLEANUP on disconnect ─────────────────────────────────────────────
+        ws_rooms.pop(ws, None)
         if code and code in rooms:
             room = rooms[code]
+            # Notify the other player
             other_ws = room["guest"] if role == "host" else room["host"]
             if other_ws is not None:
                 try:
                     await other_ws.send(json.dumps({"t": "partner_left"}))
                 except Exception:
                     pass
-            del rooms[code]
-            print(f"[-] Room '{code}' closed ({role} disconnected)  (active rooms: {len(rooms)})")
+            # Clear our slot instead of deleting the entire room
+            if role == "host":
+                room["host"] = None
+            else:
+                room["guest"] = None
+            # Only delete room if both slots are empty
+            if room["host"] is None and room["guest"] is None:
+                del rooms[code]
+                print(f"[-] Room '{code}' deleted (both disconnected)  (active rooms: {len(rooms)})")
+            else:
+                print(f"[-] {role} left room '{code}' (partner still connected)  (active rooms: {len(rooms)})")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
