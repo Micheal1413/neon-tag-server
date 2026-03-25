@@ -27,8 +27,30 @@
 #  IMPORTS
 # ═════════════════════════════════════════════════════════════════════════════
 
-import sys, math, random, asyncio, json, time as _time
+import sys, math, random, asyncio, time as _time
 from typing import Optional, List, Dict, Any
+
+# ── Fast JSON: orjson (9x faster) with stdlib fallback ──────────────────────
+try:
+    import orjson as _json_mod
+    def _dumps(obj: Any) -> bytes:
+        """Serialize to bytes (binary websocket frame, zero-copy)."""
+        return _json_mod.dumps(obj)
+    def _loads(data) -> Any:
+        """Deserialize from bytes or str."""
+        return _json_mod.loads(data)
+    _JSON_ENGINE = "orjson"
+except ImportError:
+    import json as _json_mod  # type: ignore[assignment]
+    def _dumps(obj: Any) -> bytes:  # type: ignore[misc]
+        """Serialize to bytes (compatible with binary ws frames)."""
+        return _json_mod.dumps(obj, separators=(',', ':')).encode('utf-8')
+    def _loads(data) -> Any:  # type: ignore[misc]
+        """Deserialize from bytes or str."""
+        if isinstance(data, bytes):
+            data = data.decode('utf-8')
+        return _json_mod.loads(data)
+    _JSON_ENGINE = "json"
 
 import pygame
 from pygame.math import Vector2
@@ -373,6 +395,83 @@ MAPS: Dict[int, Dict] = {
             pf( 78, 474, WT,  82),   pf(842, 474, WT,  82),
         ],
     ),
+
+    # ── 6: SPIRAL ─────────────────────────────────────────────────────────────
+    6: dict(
+        name  = "SPIRAL",
+        floor = ((14, 10, 26), (17, 13, 32)),
+        p1    = pfp(460, 300),
+        p2    = pfp( 60,  60),
+        walls = [
+            # Outer ring (clockwise spiral)
+            pf(120,  60, 780, WT),                       # top
+            pf(880,  60, WT, 500),                       # right
+            pf(120, 540, 780, WT),                       # bottom (gap at left)
+            pf(120, 140, WT, 420),                       # left inner
+            # Second ring
+            pf(220, 140, 560, WT),                       # top inner
+            pf(760, 140, WT, 320),                       # right inner
+            pf(310, 440, 470, WT),                       # bottom inner (gap at left)
+            pf(220, 240, WT, 220),                       # left inner 2
+            # Core
+            pf(350, 240, 300, WT),                       # top core
+            pf(350, 240, WT, 120),                       # left core
+            pf(630, 240, WT, 120),                       # right core (gap at bottom)
+            pf(350, 340, 180, WT),                       # bottom core (gap at right)
+        ],
+    ),
+
+    # ── 7: TUNNELS ────────────────────────────────────────────────────────────
+    7: dict(
+        name  = "TUNNELS",
+        floor = ((10, 12, 20), (13, 15, 25)),
+        p1    = pfp( 60, 100),
+        p2    = pfp(860, 500),
+        walls = [
+            # Horizontal tunnels
+            pf(  0, 180, 320, WT),   pf(600, 180, 320, WT),
+            pf(  0, 420, 320, WT),   pf(600, 420, 320, WT),
+            # Vertical dividers with gaps
+            pf(200,   0, WT, 100),   pf(200, 250, WT, 100),
+            pf(200, 500, WT, 112),
+            pf(450,   0, WT, 130),   pf(450, 280, WT,  60),
+            pf(450, 480, WT, 132),
+            pf(700,   0, WT, 100),   pf(700, 250, WT, 100),
+            pf(700, 500, WT, 112),
+            # Small cover blocks in tunnels
+            pf(100, 260,  60,  60),  pf(760, 260,  60,  60),
+            pf(340, 100,  60,  60),  pf(520, 440,  60,  60),
+            pf(440, 340,  80,  50),  pf(400, 180,  40,  40),
+        ],
+    ),
+
+    # ── 8: FORTRESS ───────────────────────────────────────────────────────────
+    8: dict(
+        name  = "FORTRESS",
+        floor = ((13, 10, 24), (16, 13, 30)),
+        p1    = pfp( 80, 300),
+        p2    = pfp(840, 300),
+        walls = [
+            # Central fortress
+            pf(340, 190, 240, WT),                       # top wall
+            pf(340, 400, 240, WT),                       # bottom wall
+            pf(340, 190, WT, 80),                        # left top
+            pf(340, 340, WT, 80),                        # left bottom (gap = door)
+            pf(560, 190, WT, 80),                        # right top
+            pf(560, 340, WT, 80),                        # right bottom (gap = door)
+            # Outer corner bunkers
+            pf( 40,  40, 120, WT),   pf( 40,  40, WT, 80),
+            pf(760,  40, 120, WT),   pf(860,  40, WT, 80),
+            pf( 40, 520, 120, WT),   pf( 40, 482, WT, 60),
+            pf(760, 520, 120, WT),   pf(860, 482, WT, 60),
+            # Corridor walls
+            pf(190, 160, WT, 100),   pf(720, 160, WT, 100),
+            pf(190, 340, WT, 100),   pf(720, 340, WT, 100),
+            # Top/bottom walls
+            pf(300,  80, WT, 60),    pf(620,  80, WT, 60),
+            pf(300, 460, WT, 60),    pf(620, 460, WT, 60),
+        ],
+    ),
 }
 
 
@@ -605,8 +704,9 @@ class Player:
 class NetworkManager:
     """Non-blocking async WebSocket client with auto-reconnect & ping."""
 
-    MAX_RECONNECT = 3
-    PING_INTERVAL = 2.0     # seconds between ping measurements
+    MAX_RECONNECT = 5
+    PING_INTERVAL = 3.0     # seconds between ping measurements
+    PING_MISS_MAX = 3       # disconnect after this many missed pongs
 
     def __init__(self):
         self.ws           = None
@@ -621,6 +721,12 @@ class NetworkManager:
         self.ping_ms: float = -1     # latest round-trip in ms (-1 = unknown)
         self.reconnecting = False
         self._reconnect_count = 0
+        self._closing     = False    # True when intentionally closing
+        # For reconnect: remember what room we were in
+        self._room_code: Optional[str] = None
+        self._room_role: Optional[str] = None  # 'host' | 'guest'
+        # Missed pong counter
+        self._pong_pending = 0
 
     async def connect(self, url:str)->bool:
         if not _ONLINE_OK:
@@ -628,15 +734,37 @@ class NetworkManager:
         self._url = url
         return await self._do_connect(url)
 
+    def set_room_info(self, code: str, role: str)->None:
+        """Store room info so reconnect can re-join the room."""
+        self._room_code = code
+        self._room_role = role
+
     async def _do_connect(self, url:str)->bool:
+        # Cancel any old tasks before starting new ones
+        for task in (self._recv_task, self._send_task, self._ping_task):
+            if task and not task.done():
+                task.cancel()
+        # Drain old send queue to avoid stuck messages
+        while not self.send_q.empty():
+            try: self.send_q.get_nowait()
+            except asyncio.QueueEmpty: break
         try:
+            # Disable library-level ping on CLIENT side to avoid dual-ping
+            # conflict. We use our own JSON ping/pong for latency measurement.
+            # The SERVER still has library-level ping enabled as a safety net.
             self.ws = await websockets.connect(url, open_timeout=8,
-                                                ping_interval=20, ping_timeout=20,
+                                                ping_interval=None,
+                                                ping_timeout=None,
                                                 close_timeout=10,
                                                 max_size=2**16,
                                                 compression=None)
+            # Disable Nagle's algorithm for lower latency on small packets
+            sock = self.ws.transport.get_extra_info('socket')
+            if sock:
+                import socket as _sock_mod
+                sock.setsockopt(_sock_mod.IPPROTO_TCP, _sock_mod.TCP_NODELAY, 1)
             self.connected=True; self.error=None
-            self._reconnect_count = 0
+            self._pong_pending = 0
             self.reconnecting = False
             self._recv_task=asyncio.create_task(self._recv_loop())
             self._send_task=asyncio.create_task(self._send_loop())
@@ -648,16 +776,24 @@ class NetworkManager:
     async def _recv_loop(self)->None:
         try:
             async for raw in self.ws:
-                msg = json.loads(raw)
+                try:
+                    msg = _loads(raw)
+                except (ValueError, Exception):
+                    continue
                 if msg.get("t") == "pong":
                     sent = msg.get("ts", 0)
                     self.ping_ms = (_time.time() * 1000) - sent
+                    self._pong_pending = 0  # reset miss counter
                 else:
                     await self.recv_q.put(msg)
+        except websockets.exceptions.ConnectionClosed:
+            pass
         except Exception:
             pass
         finally:
             self.connected=False
+            if self._closing:
+                return
             # Try auto-reconnect before signaling disconnect
             if self._reconnect_count < self.MAX_RECONNECT and self._url:
                 asyncio.create_task(self._auto_reconnect())
@@ -666,12 +802,22 @@ class NetworkManager:
 
     async def _auto_reconnect(self)->None:
         self._reconnect_count += 1
-        delay = min(2 ** self._reconnect_count, 8)  # 2s, 4s, 8s
+        delay = min(1.0 + self._reconnect_count * 1.5, 8)  # 2.5s, 4s, 5.5s, 7s, 8s
         self.reconnecting = True
         self.error = f"Reconnecting ({self._reconnect_count}/{self.MAX_RECONNECT})…"
         await asyncio.sleep(delay)
         ok = await self._do_connect(self._url)
-        if not ok:
+        if ok:
+            # Re-join the room we were in before disconnect
+            self._reconnect_count = 0
+            if self._room_role and self._room_code:
+                if self._room_role == "guest":
+                    self.send({"t":"join","code":self._room_code})
+                elif self._room_role == "host":
+                    self.send({"t":"rejoin","code":self._room_code})
+                # Signal the game layer that we reconnected
+                await self.recv_q.put({"t":"_reconnected"})
+        else:
             if self._reconnect_count < self.MAX_RECONNECT:
                 asyncio.create_task(self._auto_reconnect())
             else:
@@ -682,48 +828,127 @@ class NetworkManager:
         try:
             while True:
                 msg=await self.send_q.get()
-                if msg is None: break
-                if self.connected:
-                    await self.ws.send(json.dumps(msg))
+                if msg is None:
+                    break
+                if self.connected and self.ws:
+                    try:
+                        await self.ws.send(_dumps(msg))
+                    except websockets.exceptions.ConnectionClosed:
+                        self.connected = False
+                        break
+                    except Exception:
+                        pass
+        except asyncio.CancelledError:
+            pass
         except Exception:
             pass
 
     async def _ping_loop(self)->None:
-        """Periodically measure round-trip latency via server ping."""
+        """Periodically measure round-trip latency via server ping.
+        Also detects dead connections by counting missed pongs."""
         try:
-            while self.connected:
+            while True:
                 await asyncio.sleep(self.PING_INTERVAL)
-                if self.connected:
-                    ts = _time.time() * 1000
-                    self.send({"t":"ping","ts":ts})
+                if not self.connected:
+                    break
+                # Check if previous pongs were missed
+                if self._pong_pending >= self.PING_MISS_MAX:
+                    self.connected = False
+                    self.error = "Connection timed out (no pong)"
+                    if self.ws:
+                        try: await self.ws.close()
+                        except Exception: pass
+                    break
+                self._pong_pending += 1
+                ts = _time.time() * 1000
+                self.send({"t":"ping","ts":ts})
+        except asyncio.CancelledError:
+            pass
         except Exception:
             pass
 
     def send(self, msg:Dict)->None:
-        if self.connected: self.send_q.put_nowait(msg)
+        if self.connected:
+            try: self.send_q.put_nowait(msg)
+            except asyncio.QueueFull: pass
 
     def recv(self)->Optional[Dict]:
         try:    return self.recv_q.get_nowait()
         except asyncio.QueueEmpty: return None
 
     async def close(self)->None:
+        self._closing = True
         self.connected=False
         self._reconnect_count = self.MAX_RECONNECT  # prevent auto-reconnect
-        self.send_q.put_nowait(None)
-        if self._recv_task: self._recv_task.cancel()
-        if self._send_task: self._send_task.cancel()
-        if self._ping_task: self._ping_task.cancel()
+        # Signal send loop to stop
+        try: self.send_q.put_nowait(None)
+        except asyncio.QueueFull: pass
+        # Cancel all background tasks
+        for task in (self._recv_task, self._send_task, self._ping_task):
+            if task and not task.done():
+                task.cancel()
+        # Close the websocket
         if self.ws:
             try: await self.ws.close()
             except Exception: pass
+        # Drain queues to prevent coroutines stuck waiting
+        while not self.send_q.empty():
+            try: self.send_q.get_nowait()
+            except asyncio.QueueEmpty: break
+        while not self.recv_q.empty():
+            try: self.recv_q.get_nowait()
+            except asyncio.QueueEmpty: break
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  CLIPBOARD HELPERS  (Windows – subprocess fallback)
+#  CLIPBOARD HELPERS  (pygame.scrap – instant, no blocking)
 # ═════════════════════════════════════════════════════════════════════════════
+
+_scrap_inited = False
+
+def _ensure_scrap():
+    global _scrap_inited
+    if not _scrap_inited:
+        try:
+            pygame.scrap.init()
+            _scrap_inited = True
+        except Exception:
+            pass
 
 def _clipboard_get() -> str:
-    """Read text from the system clipboard."""
+    """Read text from the system clipboard (non-blocking via pygame.scrap).
+    Handles Windows UTF-16 encoding quirk."""
+    _ensure_scrap()
+    if _scrap_inited:
+        try:
+            # Try UTF-8 charset first (works on some systems)
+            data = pygame.scrap.get("text/plain;charset=utf-8")
+            if not data:
+                data = pygame.scrap.get(pygame.SCRAP_TEXT)
+            if data and isinstance(data, bytes):
+                # Strip null terminators first
+                raw = data.rstrip(b'\x00')
+                if not raw:
+                    return ""
+                # On Windows, pygame.scrap often returns UTF-16 encoded bytes
+                # Try UTF-16 first (has BOM or null bytes between chars)
+                if b'\x00' in raw:
+                    try:
+                        return raw.decode('utf-16', errors='ignore').strip()
+                    except Exception:
+                        pass
+                # Try UTF-8
+                try:
+                    return raw.decode('utf-8', errors='ignore').strip()
+                except Exception:
+                    pass
+                # Last resort: latin-1 (never fails)
+                return raw.decode('latin-1', errors='ignore').strip()
+            elif data:
+                return str(data).strip()
+        except Exception:
+            pass
+    # Fallback to subprocess (slower)
     try:
         import subprocess
         r = subprocess.run(
@@ -735,7 +960,17 @@ def _clipboard_get() -> str:
         return ""
 
 def _clipboard_set(text: str) -> None:
-    """Write text to the system clipboard."""
+    """Write text to the system clipboard (non-blocking via pygame.scrap).
+    Encodes with null terminator for Windows compatibility."""
+    _ensure_scrap()
+    if _scrap_inited:
+        try:
+            # Include null terminator — Windows expects it
+            pygame.scrap.put(pygame.SCRAP_TEXT, text.encode('utf-8') + b'\x00')
+            return
+        except Exception:
+            pass
+    # Fallback
     try:
         import subprocess
         subprocess.Popen(
@@ -820,10 +1055,15 @@ class TextInput:
                 break
             if self.force_lower:
                 ch = ch.lower()
-            if ch.isprintable() and not ch.isspace():
-                if self.allowed is None or ch.lower() in self.allowed:
-                    self.text = self.text[:self.cur] + ch + self.text[self.cur:]
-                    self.cur += 1
+            # Allow all printable chars; block whitespace only for restricted inputs
+            if not ch.isprintable():
+                continue
+            if self.force_lower and ch.isspace():
+                continue  # no spaces in room codes
+            if self.allowed is not None and ch.lower() not in self.allowed:
+                continue
+            self.text = self.text[:self.cur] + ch + self.text[self.cur:]
+            self.cur += 1
 
     def _word_left(self) -> int:
         i = self.cur - 1
@@ -967,6 +1207,13 @@ class TextInput:
 
     def draw(self, surf: pygame.Surface, rect: pygame.Rect,
              label: str = "", error: str = "") -> None:
+        # Enhanced active glow
+        if self.active:
+            glow_rect = rect.inflate(6, 6)
+            gs = pygame.Surface((glow_rect.width, glow_rect.height), pygame.SRCALPHA)
+            gc = (*TXT_P1, 35)
+            pygame.draw.rect(gs, gc, gs.get_rect(), border_radius=7)
+            surf.blit(gs, glow_rect.topleft)
         pygame.draw.rect(surf, (18, 14, 36), rect, border_radius=5)
         bc = TXT_P1 if self.active else (TXT_ERR if error else HUD_LINE)
         pygame.draw.rect(surf, bc, rect, 2, border_radius=5)
@@ -1065,7 +1312,7 @@ def draw_hud(surf:pygame.Surface, p1:'Player', p2:'Player',
     surf.blit(r_surf,r_surf.get_rect(center=(WIN_W//2,ROW2+r_surf.get_height()//2+1)))
 
     # ── map name ──────────────────────────────────────────────────────────────
-    info=F_XS.render(f"MAP {map_id}: {map_name}  [1-5]",True,TXT_DIM)
+    info=F_XS.render(f"MAP {map_id}: {map_name}  [1-8]",True,TXT_DIM)
     surf.blit(info,info.get_rect(center=(WIN_W//2,HUD_H-9)))
 
     # ── P2 right side ─────────────────────────────────────────────────────────
@@ -1208,7 +1455,7 @@ def draw_menu(surf:pygame.Surface, pulse:float, map_id:int,
         ("P1 (Cyan)    →  W A S D",                              TXT_P1),
         ("P2 (Orange)  →  Arrow Keys",                           TXT_P2),
         ("",                                                      TXT_DIM),
-        ("1 – 5  Switch Map    R  Restart    ESC  Menu",         TXT_HI),
+        ("1 – 8  Switch Map    R  Restart    ESC  Menu",         TXT_HI),
         ("",                                                      TXT_DIM),
         ("NOT IT: +1 pt/s     IS IT: −0.8 pt/s   (90s rounds)", TXT_DIM),
         ("Best of 3 rounds  →  first to 2 round-wins",          TXT_DIM),
@@ -1249,7 +1496,7 @@ def draw_online_menu(surf:pygame.Surface,
     url_input.draw(surf,url_rect,label="Server URL (run neon_tag_server.py)")
 
     if sub_state=="choose":
-        # HOST / JOIN buttons
+        # HOST / JOIN buttons — with glow and hover
         bw,bh=180,52
         hx,jx=WIN_W//2-bw-20,WIN_W//2+20
         by=184
@@ -1258,10 +1505,28 @@ def draw_online_menu(surf:pygame.Surface,
         hcol=(int(40+p*20),int(100+p*60),int(200+p*55))
         jcol=(int(180+p*50),int(80+p*30),int(30+p*15))
 
-        pygame.draw.rect(surf,hcol,(hx,by,bw,bh),border_radius=8)
-        pygame.draw.rect(surf,jcol,(jx,by,bw,bh),border_radius=8)
-        pygame.draw.rect(surf,TXT_P1,(hx,by,bw,bh),2,border_radius=8)
-        pygame.draw.rect(surf,TXT_P2,(jx,by,bw,bh),2,border_radius=8)
+        # Glow behind buttons
+        gs_h=glow_surf(100,hcol)
+        gs_j=glow_surf(100,jcol)
+        surf.blit(gs_h,(hx+bw//2-100,by+bh//2-80),special_flags=pygame.BLEND_RGBA_ADD)
+        surf.blit(gs_j,(jx+bw//2-100,by+bh//2-80),special_flags=pygame.BLEND_RGBA_ADD)
+
+        # Hover detection
+        mx,my=pygame.mouse.get_pos()
+        h_hover=pygame.Rect(hx,by,bw,bh).collidepoint(mx,my)
+        j_hover=pygame.Rect(jx,by,bw,bh).collidepoint(mx,my)
+
+        # Button fill (brighter on hover)
+        h_fill=tuple(min(255,c+40) for c in hcol) if h_hover else hcol
+        j_fill=tuple(min(255,c+40) for c in jcol) if j_hover else jcol
+        pygame.draw.rect(surf,h_fill,(hx,by,bw,bh),border_radius=8)
+        pygame.draw.rect(surf,j_fill,(jx,by,bw,bh),border_radius=8)
+
+        # Border (thicker on hover)
+        bw_h=3 if h_hover else 2
+        bw_j=3 if j_hover else 2
+        pygame.draw.rect(surf,TXT_P1,(hx,by,bw,bh),bw_h,border_radius=8)
+        pygame.draw.rect(surf,TXT_P2,(jx,by,bw,bh),bw_j,border_radius=8)
 
         h_lbl=F_LG.render("HOST",True,TXT_HI)
         j_lbl=F_LG.render("JOIN",True,TXT_HI)
@@ -1495,24 +1760,25 @@ class Game:
             self._load_map(mid,keep_wins=True)
 
         elif t=="state" and self.online_role=="guest":
-            # Apply authoritative state from host
+            # Apply authoritative state from host (supports delta compression —
+            # only present keys are updated)
             if self.p1 and "p1" in msg: self.p1.apply_state(msg["p1"])
             if self.p2 and "p2" in msg: self.p2.apply_state(msg["p2"])
-            self.time_left=float(msg.get("tl",ROUND_TIME))
-            self.p1_wins  =int(msg.get("w1",0))
-            self.p2_wins  =int(msg.get("w2",0))
-            self.round_num=int(msg.get("rn",1))
+            if "tl" in msg: self.time_left=float(msg["tl"])
+            if "w1" in msg: self.p1_wins  =int(msg["w1"])
+            if "w2" in msg: self.p2_wins  =int(msg["w2"])
+            if "rn" in msg: self.round_num=int(msg["rn"])
             # Tag effects sync: host signals when a tag happened
             if msg.get("tag") and self.p2:
                 tx = float(msg["tag"].get("x", self.p2.pos.x))
                 ty = float(msg["tag"].get("y", self.p2.pos.y))
                 self._trigger_tag_effects(tx, ty)
-            ph=msg.get("ph","playing")
+            ph=msg.get("ph")
             if ph=="countdown":
                 if self.state not in (self.COUNTDOWN,):
                     self.state=self.COUNTDOWN
-                self.cd_idx  =int(msg.get("cd",0))
-                self.cd_timer=float(msg.get("cdt",0.5))
+                if "cd" in msg:  self.cd_idx  =int(msg["cd"])
+                if "cdt" in msg: self.cd_timer=float(msg["cdt"])
             elif ph=="playing" and self.state!=self.PLAYING:
                 self.state=self.PLAYING
             elif ph=="round_end" and self.state!=self.ROUND_END:
@@ -1529,12 +1795,30 @@ class Game:
                                 'l':int(msg.get('l',0)),'r':int(msg.get('r',0))}
             if self.p2: self.p2.net_keys=self._guest_input
 
-        elif t=="_disconnected" or t=="partner_left":
+        elif t=="partner_left":
+            # Partner left but OUR connection is fine — stay in the session
+            self.net_status="Partner disconnected — waiting for rejoin…"
+            self.net_status_c=TXT_ERR
+            if self.state not in (self.MENU,self.ONLINE_MENU):
+                self.state=self.ONLINE_MENU
+                self.online_sub="waiting" if self.online_role=="host" else "choose"
+
+        elif t=="_disconnected":
+            # OUR connection died and all reconnect attempts failed
             self.net_status="Connection lost"; self.net_status_c=TXT_ERR
             self.online_role=None
             if self.state not in (self.MENU,self.ONLINE_MENU):
                 self.state=self.ONLINE_MENU
                 self.online_sub="choose"
+
+        elif t=="_reconnected":
+            # We reconnected and re-joined the room
+            self.net_status="Reconnected!"; self.net_status_c=TXT_OK
+            if self.net:
+                self.net.reconnecting = False
+            # If we were host, re-send map info so guest can sync
+            if self.online_role=="host" and self.net:
+                self.net.send({"t":"map","map":self.map_id})
 
     # ── update ────────────────────────────────────────────────────────────────
 
@@ -1647,7 +1931,8 @@ class Game:
                 self._send_host_state(phase="playing")
 
     def _send_host_state(self, phase:str)->None:
-        """Build & queue state message to guest."""
+        """Build & queue state message to guest. Uses delta compression —
+        only sends fields that changed since last message."""
         if not (self.net and self.p1 and self.p2): return
         extra={}
         if phase=="countdown":
@@ -1660,13 +1945,38 @@ class Game:
             prey = self.p2 if self.p1.is_it else self.p1
             extra["tag"] = {"x": round(prey.pos.x, 1), "y": round(prey.pos.y, 1)}
             self._tag_happened = False
-        self.net.send({"t":"state","ph":phase,
-                       "tl":round(self.time_left,2),
-                       "w1":self.p1_wins,"w2":self.p2_wins,
-                       "rn":self.round_num,
-                       "p1":self.p1.get_state(),
-                       "p2":self.p2.get_state(),
-                       **extra})
+        full={"t":"state","ph":phase,
+              "tl":round(self.time_left,2),
+              "w1":self.p1_wins,"w2":self.p2_wins,
+              "rn":self.round_num,
+              "p1":self.p1.get_state(),
+              "p2":self.p2.get_state(),
+              **extra}
+
+        # ── Delta compression ────────────────────────────────────────────────
+        # Send keyframe every 60 ticks (~3s) or when phase changes
+        if not hasattr(self, '_last_state'):
+            self._last_state = {}
+            self._delta_count = 0
+        self._delta_count += 1
+        force_full = (self._delta_count >= 60 or
+                      self._last_state.get("ph") != phase)
+        if force_full:
+            self._delta_count = 0
+            self._last_state = full.copy()
+            self.net.send(full)
+        else:
+            # Only send keys that differ
+            delta = {"t": "state"}
+            for k, v in full.items():
+                if k == "t":
+                    continue
+                if self._last_state.get(k) != v:
+                    delta[k] = v
+            # Only send if there are actual changes beyond the type key
+            if len(delta) > 1:
+                self._last_state = full.copy()
+                self.net.send(delta)
 
     # ── draw ─────────────────────────────────────────────────────────────────
 
@@ -1768,7 +2078,7 @@ class Game:
                     self.net_status=""
                 elif k==pygame.K_ESCAPE:
                     return False
-                elif pygame.K_1<=k<=pygame.K_5:
+                elif pygame.K_1<=k<=pygame.K_8:
                     self._load_map(k-pygame.K_0)
                 return True
 
@@ -1793,7 +2103,7 @@ class Game:
             elif k==pygame.K_r and self.online_role is None:
                 self.p1_wins=0; self.p2_wins=0; self.round_num=1
                 self._load_map(self.map_id); self._start_countdown()
-            elif pygame.K_1<=k<=pygame.K_5 and self.online_role is None:
+            elif pygame.K_1<=k<=pygame.K_8 and self.online_role is None:
                 n=k-pygame.K_0
                 self._load_map(n,keep_wins=(self.state!=self.MENU))
                 self._start_countdown()
@@ -1854,6 +2164,8 @@ class Game:
                         self.online_code=msg["code"]
                         self.online_sub="waiting"
                         self.net_status=""; self.net_status_c=TXT_DIM
+                        # Store room info for auto-reconnect
+                        nm.set_room_info(msg["code"], "host")
                         # Copy code to clipboard
                         _clipboard_set(msg['code'].upper())
                         break
@@ -1885,6 +2197,8 @@ class Game:
                         self.online_code=code; self.online_sub="joining"
                         self.net_status="Connected! Waiting for host to start…"
                         self.net_status_c=TXT_OK
+                        # Store room info for auto-reconnect
+                        nm.set_room_info(code, "guest")
                         break
                     elif msg.get("t")=="err":
                         self.net_status=f"Error: {msg.get('msg','?')}"; self.net_status_c=TXT_ERR
@@ -1922,4 +2236,3 @@ async def main()->None:
 
 if __name__=="__main__":
     asyncio.run(main())
-
