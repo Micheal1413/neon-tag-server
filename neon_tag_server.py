@@ -28,11 +28,28 @@ Protocol (all JSON):
 """
 
 import asyncio
-import json
 import os
 import random
 import sys
 import time
+
+# ── Fast JSON: orjson (9x faster) with stdlib fallback ──────────────────────
+try:
+    import orjson as _json_mod
+    def _dumps(obj) -> bytes:
+        return _json_mod.dumps(obj)
+    def _loads(data) -> dict:
+        return _json_mod.loads(data)
+    _JSON_ENGINE = "orjson"
+except ImportError:
+    import json as _json_mod  # type: ignore[assignment]
+    def _dumps(obj) -> bytes:  # type: ignore[misc]
+        return _json_mod.dumps(obj, separators=(',', ':')).encode('utf-8')
+    def _loads(data) -> dict:  # type: ignore[misc]
+        if isinstance(data, bytes):
+            data = data.decode('utf-8')
+        return _json_mod.loads(data)
+    _JSON_ENGINE = "json"
 
 try:
     import websockets
@@ -115,14 +132,23 @@ async def cleanup_stale_rooms() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def handler(ws) -> None:
+    # Disable Nagle's algorithm for lower latency
+    try:
+        sock = ws.transport.get_extra_info('socket')
+        if sock:
+            import socket as _sock_mod
+            sock.setsockopt(_sock_mod.IPPROTO_TCP, _sock_mod.TCP_NODELAY, 1)
+    except Exception:
+        pass
+
     role: str | None = None
     code: str | None = None
 
     try:
         async for raw in ws:
             try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
+                msg = _loads(raw)
+            except (ValueError, Exception):
                 continue
 
             t = msg.get("t", "")
@@ -135,16 +161,40 @@ async def handler(ws) -> None:
                 rooms[code] = {"host": ws, "guest": None, "last_active": time.time()}
                 ws_rooms[ws] = (code, "host")
                 role = "host"
-                await ws.send(json.dumps({"t": "ok", "code": code, "role": "host"}))
+                await ws.send(_dumps({"t": "ok", "code": code, "role": "host"}))
                 print(f"[+] Room '{code}' created  (active rooms: {len(rooms)})")
+
+            # ── REJOIN ROOM (reconnecting host) ───────────────────────────────
+            elif t == "rejoin":
+                requested = str(msg.get("code", "")).strip().lower()[:4]
+                if requested not in rooms:
+                    await ws.send(_dumps({"t": "err", "msg": "Room not found"}))
+                else:
+                    _cleanup_ws_from_old_room(ws)
+                    code = requested
+                    room = rooms[code]
+                    # Re-take the host slot
+                    room["host"] = ws
+                    room["last_active"] = time.time()
+                    ws_rooms[ws] = (code, "host")
+                    role = "host"
+                    await ws.send(_dumps({"t": "ok", "code": code, "role": "host"}))
+                    # Notify guest that host is back
+                    guest_ws = room.get("guest")
+                    if guest_ws:
+                        try:
+                            await guest_ws.send(_dumps({"t": "partner_joined"}))
+                        except Exception:
+                            pass
+                    print(f"[~] Host rejoined room '{code}'  (active rooms: {len(rooms)})")
 
             # ── JOIN ROOM ─────────────────────────────────────────────────────
             elif t == "join":
                 requested = str(msg.get("code", "")).strip().lower()[:4]
                 if requested not in rooms:
-                    await ws.send(json.dumps({"t": "err", "msg": "Room not found"}))
-                elif rooms[requested]["guest"] is not None:
-                    await ws.send(json.dumps({"t": "err", "msg": "Room is full"}))
+                    await ws.send(_dumps({"t": "err", "msg": "Room not found"}))
+                elif rooms[requested]["guest"] is not None and rooms[requested]["guest"] is not ws:
+                    await ws.send(_dumps({"t": "err", "msg": "Room is full"}))
                 else:
                     _cleanup_ws_from_old_room(ws)
                     code = requested
@@ -152,12 +202,12 @@ async def handler(ws) -> None:
                     rooms[code]["last_active"] = time.time()
                     ws_rooms[ws] = (code, "guest")
                     role = "guest"
-                    await ws.send(json.dumps({"t": "ok", "role": "guest"}))
+                    await ws.send(_dumps({"t": "ok", "role": "guest"}))
                     # Notify host that their partner joined
                     host_ws = rooms[code]["host"]
                     if host_ws:
                         try:
-                            await host_ws.send(json.dumps({"t": "partner_joined"}))
+                            await host_ws.send(_dumps({"t": "partner_joined"}))
                         except Exception:
                             pass
                     print(f"[+] Guest joined room '{code}'  (active rooms: {len(rooms)})")
@@ -165,7 +215,7 @@ async def handler(ws) -> None:
             # ── PING (latency measurement) ────────────────────────────────────
             elif t == "ping":
                 ts = msg.get("ts", 0)
-                await ws.send(json.dumps({"t": "pong", "ts": ts}))
+                await ws.send(_dumps({"t": "pong", "ts": ts}))
                 if code and code in rooms:
                     rooms[code]["last_active"] = time.time()
 
@@ -178,7 +228,20 @@ async def handler(ws) -> None:
                     try:
                         await target.send(raw)
                     except Exception:
-                        pass
+                        # Target connection is broken — clean it up proactively
+                        target_role = "guest" if role == "host" else "host"
+                        room[target_role] = None
+                        ws_rooms.pop(target, None)
+                        try:
+                            await target.close()
+                        except Exception:
+                            pass
+                        # Notify sender that their partner is gone
+                        try:
+                            await ws.send(_dumps({"t": "partner_left"}))
+                        except Exception:
+                            pass
+                        print(f"[!] Broken relay to {target_role} in room '{code}' — cleaned up")
 
     except websockets.exceptions.ConnectionClosed:
         pass
@@ -194,7 +257,7 @@ async def handler(ws) -> None:
             other_ws = room["guest"] if role == "host" else room["host"]
             if other_ws is not None:
                 try:
-                    await other_ws.send(json.dumps({"t": "partner_left"}))
+                    await other_ws.send(_dumps({"t": "partner_left"}))
                 except Exception:
                     pass
             # Clear our slot instead of deleting the entire room
@@ -218,21 +281,22 @@ async def main() -> None:
     port = int(os.environ.get("PORT", 8765))
     host = "0.0.0.0"
 
-    print(f"╔══════════════════════════════════════════════╗")
-    print(f"║   Neon Tag Relay Server                      ║")
-    print(f"║   Listening on  ws://{host}:{port:<5}             ║")
-    print(f"╚══════════════════════════════════════════════╝")
+    print(f"\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557")
+    print(f"\u2551   Neon Tag Relay Server                      \u2551")
+    print(f"\u2551   Listening on  ws://{host}:{port:<5}             \u2551")
+    print(f"\u2551   JSON engine:  {_JSON_ENGINE:<12}                \u2551")
+    print(f"\u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d")
     print()
     print("Players connect from ANY network using room codes.")
-    print("Waiting for players …\n")
+    print("Waiting for players \u2026\n")
 
     # Start stale room cleanup
     asyncio.create_task(cleanup_stale_rooms())
 
     async with serve(
         handler, host, port,
-        ping_interval=20,
-        ping_timeout=20,
+        ping_interval=30,
+        ping_timeout=30,
         close_timeout=10,
         max_size=2**16,         # 64KB max message (plenty for game state)
         compression=None,       # disable compression for lower latency
